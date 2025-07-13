@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
-# build.py – WetterArena v5: Komplettes Backfill + Station‐Meta
+"""
+build.py – WetterArena v8.1
+• Liest station metadata (ID, Stationsname, Bundesland, Enddatum) aus stations.csv
+• Lädt täglich (oder per --backfill START END) alle aktiven Stationen in 30-Tage-Blöcken
+• Verwendet längeren Timeout + Retries
+• Schreibt in Supabase (Postgres) und generiert site/last7.csv + site/index.html
+"""
 
-import os, sys, csv, datetime as dt, textwrap, requests, psycopg2
+import os
+import sys
+import csv
+import time
+import datetime as dt
+import textwrap
+import requests
+import psycopg2
 from typing import List
 
-# ─────────── Konfiguration ───────────
+# ─── Konfiguration ────────────────────────────────────────────
 
-# Supabase‐URI aus Secret / env
-PG_URI    = os.environ["PG_URI"]
+PG_URI     = os.environ["PG_URI"]      # z.B. postgresql://postgres:<PW>@db.xxx.supabase.co:5432/postgres
+META_CSV   = "stations.csv"            # Deine Stations-Metadaten
+DATASET    = "klima-v2-1d"
+BASE       = "https://dataset.api.hub.geosphere.at/v1"
+SITE_DIR   = "site"
+TEMPLATE   = "index_template.html"
 
-# Deine Station-Liste
-STATIONS  = [5904, 5925, 5935]
-
-# Station → Name & Bundesland (state)
-STATION_META = {
-    5904: {"name": "Wien Hohe Warte",   "state": "Wien"},
-    5925: {"name": "Wien Innere Stadt", "state": "Wien"},
-    5935: {"name": "Wien Donaufeld",    "state": "Wien"},
-}
-
-# Dataset und API-Basis
-DATASET = "klima-v2-1d"
-BASE    = "https://dataset.api.hub.geosphere.at/v1"
-
-# Alle Parameter (kleingeschrieben) + Flags
+# Parameter (kleingeschrieben) + Flags
 PARAMS = [
   "bewd_i","bewd_i_flag","bewd_ii","bewd_ii_flag","bewd_iii","bewd_iii_flag",
   "bewm_i","bewm_i_flag","bewm_ii","bewm_ii_flag","bewm_iii","bewm_iii_flag",
@@ -51,31 +54,71 @@ PARAMS = [
   "vvbft_iii","vvbft_iii_flag","vv_mittel","vv_mittel_flag","zeitx","zeitx_flag"
 ]
 
-# Meta‐Spalten + Param-Spalten
 META_COLS = ["station","name","state","lat","lon","date"]
 COLS      = META_COLS + PARAMS
 
-# Für CSV & HTML‐Output
-SITE_DIR  = "site"
-TEMPLATE  = "index_template.html"
 os.makedirs(SITE_DIR, exist_ok=True)
 
-# ──────────────────────────────────────────
+# ─── Hilfsfunktionen ──────────────────────────────────────────
 
-def log(*args): 
+def log(*args):
     print(*args, file=sys.stderr)
 
-# --- GeoSphere API ---
+def load_stations(meta_csv=META_CSV) -> tuple[List[int], dict]:
+    """
+    Liest stations.csv mit Spalten:
+      id, Stationsname, Bundesland, Enddatum (z.B. '2100-12-31T00:00:00+00:00')
+    Liefert:
+      STATIONS: IDs mit Enddatum >= heute
+      STATION_META: {id:{"name":..., "state":...}}
+    """
+    stations = []
+    mapping  = {}
+    today = dt.date.today()
+    with open(meta_csv, newline="", encoding="utf-8") as f:
+        rdr = csv.DictReader(f)
+        for row in rdr:
+            end_raw = row.get("Enddatum", "")[:10]
+            try:
+                valid_to = dt.date.fromisoformat(end_raw)
+            except:
+                continue
+            if valid_to < today:
+                continue
+            sid = int(row["id"])
+            stations.append(sid)
+            mapping[sid] = {
+                "name":  row.get("Stationsname", "").strip(),
+                "state": row.get("Bundesland", "").strip()
+            }
+    return stations, mapping
+
+STATIONS, STATION_META = load_stations()
 
 def fetch_json(day: dt.date) -> dict | None:
+    """
+    Holt JSON für einen Tag mit Retries & Timeout=120s
+    """
     url = (
         f"{BASE}/station/historical/{DATASET}"
         f"?start={day}&end={day}"
         f"&station_ids={','.join(map(str,STATIONS))}"
         f"&parameters={','.join(p.upper() for p in PARAMS)}"
     )
-    r = requests.get(url, timeout=30)
-    return r.json() if r.status_code == 200 else None
+    backoff = 1
+    for _ in range(5):
+        try:
+            r = requests.get(url, timeout=120)
+            if r.status_code == 200:
+                return r.json()
+            log(f"⚠️ HTTP {r.status_code} für {day}")
+            return None
+        except requests.exceptions.ReadTimeout:
+            log(f"⏱️ Timeout für {day}, retry in {backoff}s…")
+            time.sleep(backoff)
+            backoff *= 2
+    log(f"❌ Keine Daten für {day} nach 5 Versuchen")
+    return None
 
 def rows_from_json(js: dict) -> List[List]:
     if not js or not js.get("features"):
@@ -83,27 +126,25 @@ def rows_from_json(js: dict) -> List[List]:
     dates = [ts[:10] for ts in js["timestamps"]]
     out   = []
     for feat in js["features"]:
-        sid   = feat["properties"]["station"]
-        geom  = feat["geometry"]["coordinates"]
-        pdata = feat["properties"]["parameters"]
-        # Name + state aus Mapping, lat/lon aus geometry
-        name  = STATION_META.get(sid, {}).get("name")
-        state = STATION_META.get(sid, {}).get("state")
+        sid    = feat["properties"]["station"]
+        coords = feat["geometry"]["coordinates"]
+        pdata  = feat["properties"]["parameters"]
+        meta   = STATION_META.get(sid, {})
+        name   = meta.get("name")
+        state  = meta.get("state")
         for i, d in enumerate(dates):
-            row = [sid, name, state, geom[0], geom[1], d]
+            row = [sid, name, state, coords[0], coords[1], d]
             for p in PARAMS:
-                vals = pdata.get(p, {}).get("data", [])
-                row.append(vals[i] if i < len(vals) else None)
+                arr = pdata.get(p, {}).get("data", [])
+                row.append(arr[i] if i < len(arr) else None)
             out.append(row)
     return out
-
-# --- PostgreSQL Upsert ---
 
 INSERT_SQL = textwrap.dedent(f"""
     INSERT INTO daily ({','.join(COLS)})
     VALUES ({','.join('%s' for _ in COLS)})
     ON CONFLICT (station,date) DO NOTHING
-    """)
+""")
 
 def upsert(rows: List[List]) -> int:
     if not rows:
@@ -112,46 +153,46 @@ def upsert(rows: List[List]) -> int:
         cur.executemany(INSERT_SQL, rows)
         return cur.rowcount or 0
 
-# --- CSV‐Export ---
-
 def export_last7():
-    cut = dt.date.today() - dt.timedelta(days=7)
+    cutoff = dt.date.today() - dt.timedelta(days=7)
     with psycopg2.connect(PG_URI) as conn, conn.cursor() as cur:
         cur.execute(
             f"SELECT {','.join(COLS)} FROM daily WHERE date >= %s ORDER BY date,station",
-            (cut,)
+            (cutoff,)
         )
-        with open(f"{SITE_DIR}/last7.csv", "w", newline="") as f:
+        with open(f"{SITE_DIR}/last7.csv","w",newline="") as f:
             w = csv.writer(f)
             w.writerow(COLS)
             w.writerows(cur)
 
-# --- Tages‐Lauf / Backfill ---
-
 def run_day(day: dt.date):
     rows = rows_from_json(fetch_json(day))
     n    = upsert(rows)
-    log(f"{day} → {n} rows")
+    log(f"{day} → {n} Zeilen")
+
+# ─── Main ─────────────────────────────────────────────────────
 
 def main():
-    # args: --backfill START END
     if len(sys.argv)==4 and sys.argv[1]=="--backfill":
         start = dt.date.fromisoformat(sys.argv[2])
         end   = dt.date.fromisoformat(sys.argv[3])
-        day   = start
-        while day <= end:
-            run_day(day)
-            day += dt.timedelta(days=1)
+        chunk = start
+        while chunk <= end:
+            block_end = min(end, chunk + dt.timedelta(days=29))
+            log(f"▶️ Backfill {chunk} bis {block_end}")
+            day = chunk
+            while day <= block_end:
+                run_day(day)
+                day += dt.timedelta(days=1)
+            chunk = block_end + dt.timedelta(days=1)
     else:
-        # Standard: immer Vortag laden
         run_day(dt.date.today() - dt.timedelta(days=1))
 
-    # CSV + HTML
     export_last7()
     if os.path.exists(TEMPLATE):
         with open(TEMPLATE) as r, open(f"{SITE_DIR}/index.html","w") as w:
             w.write(r.read())
     print("🎉  WetterArena – Build abgeschlossen.")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
