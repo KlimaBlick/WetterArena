@@ -3,27 +3,31 @@ name: nightly-build
 on:
   schedule:
     - cron:  '10 3 * * *'       # täglich 03:10 UTC
-  workflow_dispatch:           # manuelles Auslösen erlaubt
+  workflow_dispatch:           # manuelles Auslösen
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - run: pip install requests psycopg2-binary python-dateutil
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary python-dateutil
 
       - name: Run build.py
         env:
           PG_URI: ${{ secrets.PG_URI }}
         run: python build.py
 
-      - uses: peaceiris/actions-gh-pages@v4
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: site
