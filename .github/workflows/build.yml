@@ -2,13 +2,17 @@ name: nightly-build
 
 on:
   schedule:
-    - cron:  '10 3 * * *'       # täglich 03:10 UTC
-  workflow_dispatch:           # manuelles Auslösen
+    - cron:  '10 3 * * *'    # täglich 03:10 UTC
+  workflow_dispatch:
+
+permissions:           #  ← NEU
+  contents: write      #  für Push auf gh-pages
+  pages:   write       #  optional, falls Du Pages-Deployment v2 nutzt
+  id-token: write      #  optional, falls Du OIDC für Pages verwendest
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
