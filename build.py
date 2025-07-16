@@ -30,15 +30,79 @@ CHUNK_SIZE   = 488           # max. station_ids pro Aufruf
 MAX_RETRIES  = 3
 MAX_WAIT     = 600           # >10 min  → Abbruch
 MAX_FAILS    = 2             
-PARAMS       = ["tl_i","tlmax","tlmin","rr","so_h"]   # abruf + DB-Spalten
-META_COLS    = ["station","name","state","lat","lon","date"]
-COLS         = META_COLS + PARAMS
 
 # GeoSphere-Limits
 MAX_PER_SEC, MAX_PER_HR = 5, 220
 HIST_SEC = deque(maxlen=MAX_PER_SEC)
 HIST_HR  = deque(maxlen=MAX_PER_HR)
 REQ_COUNT = 0
+
+META_COLS    = ["station","name","state","lat","lon","date"]
+
+# ---------------------------------------------------------------------------
+# VOLLSTÄNDIGE Parameterliste (131 Kürzel + 131 *_flag = 262 Spalten)
+# ---------------------------------------------------------------------------
+PARAMS = [
+  # Bewölkungs-Dichte & -Menge
+  "bewd_i","bewd_i_flag","bewd_ii","bewd_ii_flag","bewd_iii","bewd_iii_flag",
+  "bewm_i","bewm_i_flag","bewm_ii","bewm_ii_flag","bewm_iii","bewm_iii_flag",
+  "bewm_mittel","bewm_mittel_flag",
+  # Sturm­indikatoren
+  "bft6","bft6_flag","bft8","bft8_flag",
+  # Globalstrahlung
+  "cglo_j","cglo_j_flag",
+  # Dampfdruck
+  "dampf_i","dampf_i_flag","dampf_ii","dampf_ii_flag","dampf_iii","dampf_iii_flag",
+  "dampf_mittel","dampf_mittel_flag",
+  # Windrichtung (32 Sektoren)
+  "dd32_i","dd32_i_flag","dd32_ii","dd32_ii_flag","dd32_iii","dd32_iii_flag",
+  # Erdboden­zustand
+  "erdb_i","erdb_i_flag","erdb_ii","erdb_ii_flag","erdb_iii","erdb_iii_flag",
+  # Windspitzen
+  "ffx","ffx_flag",
+  # Ereignis-Indikatoren
+  "gew","gew_flag","glatt","glatt_flag","nebel","nebel_flag",
+  # Luftdruck
+  "p_i","p_i_flag","p_ii","p_ii_flag","p_iii","p_iii_flag",
+  "p_mittel","p_mittel_flag",
+  # Boden­ereignisse
+  "raureif","raureif_flag","reif","reif_flag",
+  # Relative Feuchte (berechnet aus Feucht-T)
+  "rfb_i","rfb_i_flag","rfb_ii","rfb_ii_flag","rfb_iii","rfb_iii_flag",
+  "rfb_mittel","rfb_mittel_flag",
+  # Relative Feuchte (direkt)
+  "rf_i","rf_i_flag","rf_ii","rf_ii_flag","rf_iii","rf_iii_flag",
+  "rf_mittel","rf_mittel_flag",
+  # Niederschlag
+  "rr","rr_flag","rr_i","rr_i_flag","rr_iii","rr_iii_flag",
+  "rra_manu","rra_manu_flag","rra_manu_i","rra_manu_i_flag",
+  "rra_manu_iii","rra_manu_iii_flag",
+  # Schnee
+  "sh","sh_flag","sh_manu","sh_manu_flag",
+  "sha_manu","sha_manu_flag","shneu_manu","shneu_manu_flag",
+  # Sichtweite
+  "sicht_i","sicht_i_flag","sicht_ii","sicht_ii_flag","sicht_iii","sicht_iii_flag",
+  # Sonne
+  "so_h","so_h_flag",
+  # Tau
+  "tau","tau_flag",
+  # Temperatur 2 m
+  "tl_i","tl_i_flag","tl_ii","tl_ii_flag","tl_iii","tl_iii_flag",
+  "tlmax","tlmax_flag","tlmin","tlmin_flag","tl_mittel","tl_mittel_flag",
+  # Temperatur 5 cm
+  "tsmin","tsmin_flag",
+  # Windstärke (Beaufort)
+  "vvbft_i","vvbft_i_flag","vvbft_ii","vvbft_ii_flag","vvbft_iii","vvbft_iii_flag",
+  # Windgeschwindigkeit Mittel
+  "vv_mittel","vv_mittel_flag",
+  # Zeit Spitze
+  "zeitx","zeitx_flag"
+]
+
+COLS         = META_COLS + PARAMS
+
+
+
 
 # ───── Setup ─────────────────────────────────────────────────────────
 os.makedirs(SITE_DIR, exist_ok=True)
