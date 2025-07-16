@@ -1,183 +1,221 @@
 #!/usr/bin/env python3
 """
-build.py – WetterArena v8.2.1  (fail-fast & CLI-Optionen)
-
-• Lädt GeoSphere-Tagesdaten (DATASET = klima-v2-1d) für alle aktiven Stationen
-  oder – per CLI – für eine Teilmenge.
-• Schreibt in Supabase (PostgreSQL) und erzeugt site/last7.csv (+ index.html).
-• Bricht sofort ab, wenn der Server 403/404 liefert, statt minutenlang zu retryen.
-
-Usage-Beispiele
----------------
-# Gestern aktualisieren (Default)
-python build.py
-
-# Backfill eines Zeitraums
-python build.py --backfill 2025-01-01 2025-01-31
-
-# Nur eine Station und 2 Parameter testen
-python build.py --stations 11035 --parameters tl_i rr --backfill 2025-01-07 2025-01-07
+build.py – WetterArena v8.2.3
+• GeoSphere-Tagesdaten → Supabase-Postgres → site/last7.csv (+index.html)
+• Neu v8.2.3
+  – fängt alle requests.exceptions.RequestException (z. B. Connection reset) ab
+  – Retry-Logik wie bei 5xx, trotzdem hartes Limit (MAX_RETRIES)
+  – Beispielwerte: PAUSE_EVERY = 10, PAUSE_SECONDS = 5 → ≈ 120 req/h
 """
 
 from __future__ import annotations
-import os, sys, csv, time, textwrap, argparse
-import datetime as dt
-from typing import List, Iterable
-import requests, psycopg2
+import argparse, csv, datetime as dt, os, sys, textwrap, time
+from itertools import islice
+from typing import Iterable, List
+
+import psycopg2, requests
+from requests.exceptions import RequestException
 
 # ─── Konfiguration ────────────────────────────────────────────
-PG_URI       = os.environ["PG_URI"]          # z.B. postgresql://postgres:<PW>@db.xxx.supabase.co:5432/postgres
-DATASET      = "klima-v2-1d"
-BASE         = "https://dataset.api.hub.geosphere.at/v1"
-META_CSV     = "stations.csv"
-SITE_DIR     = "site"
-TEMPLATE     = "index_template.html"
 
-CHUNK_SIZE   = 50        # Stationen pro Request   (klein halten!)
-MAX_RETRIES  = 2         # 1 + 1 Retry bei 5xx / Timeout
-TIMEOUT      = 90        # Sekunden pro Request
+PG_URI = os.environ["PG_URI"]       # postgresql://postgres:<PW>@db.xxx.supabase.co:5432/postgres
+META_CSV = "stations.csv"
+DATASET = "klima-v2-1d"
+BASE = "https://dataset.api.hub.geosphere.at/v1"
+
+SITE_DIR = "site"
+TEMPLATE = "index_template.html"
+
+#   API & Throttling
+SESSION = requests.Session()
+TIMEOUT = 90                  # Sekunden pro HTTP-Call
+MAX_RETRIES = 3               # 1 Original + 3 Wiederholungen
+BACKOFF0 = 30                 # erster 429-Sleep
+MAX_BACKOFF = 300             # nie länger als 5 min warten
+PAUSE_EVERY = 10              # proaktive Pause nach jeder 10. Request
+PAUSE_SECONDS = 5             # …für 5 s
+
+CHUNK_SIZE = 50               # Stationen pro API-Aufruf
 
 PARAMS_DEFAULT = [
-  "tl_i","tl_ii","tl_iii","tlmax","tlmin",
-  "rr","rr_i","rr_iii",
-  "so_h","so_h_flag",
-  # … kürzen nach Bedarf …
+  "bewd_i","bewd_ii","bewd_iii","bewm_i","bewm_ii","bewm_iii","bewm_mittel",
+  "bft6","bft8","cglo_j","dampf_i","dampf_ii","dampf_iii","dampf_mittel",
+  "dd32_i","dd32_ii","dd32_iii","erdb_i","erdb_ii","erdb_iii","ffx","gew",
+  "glatt","nebel","p_i","p_ii","p_iii","p_mittel","raureif","reif",
+  "rfb_i","rfb_ii","rfb_iii","rfb_mittel","rf_i","rf_ii","rf_iii","rf_mittel",
+  "rr","rr_i","rr_iii","rra_manu","rra_manu_i","rra_manu_iii",
+  "sh","sh_manu","sha_manu","shneu_manu","sicht_i","sicht_ii","sicht_iii",
+  "so_h","tau","tl_i","tl_ii","tl_iii","tlmax","tlmin","tl_mittel","tsmin",
+  "vvbft_i","vvbft_ii","vvbft_iii","vv_mittel","zeitx"
 ]
-
 META_COLS = ["station","name","state","lat","lon","date"]
 
-# ─── Hilfs-Funktionen ─────────────────────────────────────────
-def log(*a): print(*a, file=sys.stderr)
+# ─── Helpers ──────────────────────────────────────────────────
 
-def load_stations(meta_csv=META_CSV) -> tuple[list[int], dict[int,dict]]:
+def grouper(it: Iterable[int], n: int) -> Iterable[List[int]]:
+    it = iter(it)
+    while (chunk := list(islice(it, n))):
+        yield chunk
+
+def log(*a, **kw): print(*a, file=sys.stderr, **kw)
+
+def load_stations() -> tuple[list[int], dict[int,dict]]:
     stations, meta = [], {}
     today = dt.date.today()
-    with open(meta_csv, newline="", encoding="utf-8") as f:
+    with open(META_CSV, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             try:
-                valid_to = dt.date.fromisoformat(row.get("Enddatum", "")[:10])
+                valid_to = dt.date.fromisoformat(row.get("Enddatum","")[:10])
             except ValueError:
                 continue
-            if valid_to >= today:
-                sid = int(row["id"])
-                stations.append(sid)
-                meta[sid] = {"name": row["Stationsname"].strip(),
-                             "state": row["Bundesland"].strip()}
+            if valid_to < today:               # nur aktive
+                continue
+            sid = int(row["id"])
+            stations.append(sid)
+            meta[sid] = {
+                "name":  row.get("Stationsname","").strip(),
+                "state": row.get("Bundesland","").strip()
+            }
     return stations, meta
 
-STATIONS_ALL, ST_META = load_stations()
+STATIONS_ALL, STATION_META = load_stations()
+REQ_COUNT = 0                                    # globaler Counter
 
-def grouper(n: int, iterable: Iterable[int]) -> Iterable[list[int]]:
-    "yield lists of length ≤ n"
-    block: list[int] = []
-    for item in iterable:
-        block.append(item)
-        if len(block) == n:
-            yield block; block = []
-    if block: yield block
+# ─── Netzwerk / API ───────────────────────────────────────────
 
-def fetch_json(day: dt.date, station_ids: list[int], params: list[str]) -> dict|None:
-    url = (f"{BASE}/station/historical/{DATASET}"
-           f"?start={day}&end={day}"
-           f"&station_ids={','.join(map(str,station_ids))}"
-           f"&parameters={','.join(p.upper() for p in params)}")
+def fetch_json(day: dt.date, ids: list[int], params: list[str]) -> dict|None:
+    global REQ_COUNT
+    url = (
+        f"{BASE}/station/historical/{DATASET}"
+        f"?start={day}&end={day}"
+        f"&station_ids={','.join(map(str, ids))}"
+        f"&parameters={','.join(p.upper() for p in params)}"
+    )
 
-    backoff = 1
-    for attempt in range(MAX_RETRIES + 1):
+    retries, backoff = 0, BACKOFF0
+    while True:
+        # proaktive Bremse
+        if REQ_COUNT and REQ_COUNT % PAUSE_EVERY == 0:
+            log(f"⏸  proactive pause {PAUSE_SECONDS}s …")
+            time.sleep(PAUSE_SECONDS)
+
+        REQ_COUNT += 1
         try:
-            r = requests.get(url, timeout=TIMEOUT)
-            if r.status_code == 200:
-                return r.json()
+            r = SESSION.get(url, timeout=TIMEOUT)
+        except RequestException as e:                       # Netz-Fehler
+            log(f"⚠️  network error ({e.__class__.__name__}) – try {retries+1}/{MAX_RETRIES}")
+            r = None
 
-            if r.status_code in (403, 404):
-                log(f"🚫 HTTP {r.status_code} – {url}")
-                sys.exit(1)
+        # ---------- Erfolgs-Pfad ----------
+        if r and r.status_code == 200:
+            return r.json()
 
-            if r.status_code == 429:
-                wait = int(r.headers.get("Retry-After", backoff))
-                log(f"↻ 429 Rate-Limit: warten {wait}s …"); time.sleep(wait)
-            elif 500 <= r.status_code < 600:
-                log(f"⚠️ {r.status_code} Server-Error – Retry in {backoff}s")
-            else:
-                log(f"⚠️ HTTP {r.status_code} – Retry")
-        except (requests.Timeout, requests.ConnectionError) as e:
-            log(f"⏱️ {type(e).__name__} – Retry in {backoff}s")
-        time.sleep(backoff); backoff *= 2
-    log(f"❌  {day}: keine Daten nach {MAX_RETRIES} Retries")
-    return None
+        # ---------- Abbruch ohne Retry ----------
+        if r and r.status_code in (403, 404):
+            log(f"🚫  HTTP {r.status_code} for {day} ({len(ids)} IDs) – skipping block")
+            return None
+
+        # ---------- Retry bei 429 ----------
+        if r and r.status_code == 429:
+            if retries >= MAX_RETRIES:
+                log(f"❌  429 after {MAX_RETRIES} retries – giving up day {day}")
+                return None
+            wait = min(backoff, MAX_BACKOFF)
+            log(f"↻  429 Rate-Limit: wait {wait}s …")
+            time.sleep(wait)
+            retries += 1
+            backoff = min(backoff*2, MAX_BACKOFF)
+            continue
+
+        # ---------- Retry bei 5xx oder Netzfehler ----------
+        if retries >= MAX_RETRIES:
+            log(f"❌  failed after {MAX_RETRIES} retries – skipping block {day}")
+            return None
+        retries += 1
+        sleep = 2**retries
+        log(f"↻  retry {retries}/{MAX_RETRIES} in {sleep}s …")
+        time.sleep(sleep)
 
 def rows_from_json(js: dict, params: list[str]) -> list[list]:
     if not js or not js.get("features"): return []
     dates = [ts[:10] for ts in js["timestamps"]]
-    rows  = []
+    out: list[list] = []
     for feat in js["features"]:
-        sid, coords = feat["properties"]["station"], feat["geometry"]["coordinates"]
-        pdata       = feat["properties"]["parameters"]
-        meta        = ST_META.get(sid, {})
+        sid  = feat["properties"]["station"]
+        lon, lat = feat["geometry"]["coordinates"]
+        pdata = feat["properties"]["parameters"]
+        meta  = STATION_META.get(sid, {})
         for i, d in enumerate(dates):
-            row = [sid, meta.get("name"), meta.get("state"), coords[0], coords[1], d]
+            row = [sid, meta.get("name"), meta.get("state"), lat, lon, d]
             for p in params:
                 arr = pdata.get(p, {}).get("data", [])
                 row.append(arr[i] if i < len(arr) else None)
-            rows.append(row)
-    return rows
+            out.append(row)
+    return out
 
-def upsert(rows: list[list], cols: list[str]) -> int:
+def upsert_rows(rows: list[list], cols: list[str]) -> int:
     if not rows: return 0
-    sql = (f"INSERT INTO daily ({','.join(cols)}) VALUES "
-           f"({','.join('%s' for _ in cols)}) ON CONFLICT (station,date) DO NOTHING")
+    sql = textwrap.dedent(f"""
+        INSERT INTO daily ({','.join(cols)})
+        VALUES ({','.join('%s' for _ in cols)})
+        ON CONFLICT (station,date) DO NOTHING
+    """)
     with psycopg2.connect(PG_URI) as conn, conn.cursor() as cur:
-        cur.executemany(sql, rows); return cur.rowcount or 0
+        cur.executemany(sql, rows)
+        return cur.rowcount or 0
 
 def export_last7(cols: list[str]):
     cutoff = dt.date.today() - dt.timedelta(days=7)
     with psycopg2.connect(PG_URI) as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT {','.join(cols)} FROM daily WHERE date >= %s "
-                    "ORDER BY date,station", (cutoff,))
+        cur.execute(
+            f"SELECT {','.join(cols)} FROM daily WHERE date >= %s ORDER BY date,station",
+            (cutoff,)
+        )
         os.makedirs(SITE_DIR, exist_ok=True)
         with open(f"{SITE_DIR}/last7.csv","w",newline="") as f:
-            w = csv.writer(f); w.writerow(cols); w.writerows(cur)
+            csv.writer(f).writerows([cols, *cur])
 
-def run_day(day: dt.date, station_ids: list[int], params: list[str], cols: list[str]):
-    total = 0
-    for block in grouper(CHUNK_SIZE, station_ids):
-        js   = fetch_json(day, block, params)
-        rows = rows_from_json(js, params)
-        total += upsert(rows, cols)
-    log(f"{day} → {total} Zeilen")
+def run_day(day: dt.date, station_ids: list[int], params: list[str]):
+    day_rows: list[list] = []
+    for block in grouper(station_ids, CHUNK_SIZE):
+        js = fetch_json(day, block, params)
+        day_rows.extend(rows_from_json(js, params))
+    added = upsert_rows(day_rows, META_COLS + params)
+    log(f"{day} → {added} rows")
 
-# ─── main() ───────────────────────────────────────────────────
-def parse_cli():
-    ap = argparse.ArgumentParser(description="GeoSphere → Supabase Loader")
+# ─── CLI / Main ───────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="GeoSphere daily loader")
     ap.add_argument("--backfill", nargs=2, metavar=("START","END"),
-                    help="Zeitraum yyyy-mm-dd yyyy-mm-dd")
-    ap.add_argument("--stations",  help="Komma-Liste Station-IDs")
-    ap.add_argument("--parameters", help="Parameter, z. B. tl_i,rr")
+                    help="ISO dates inclusive")
+    ap.add_argument("--stations", nargs="+", type=int,
+                    help="restrict to given station IDs")
+    ap.add_argument("--parameters", nargs="+",
+                    help="restrict to given parameter names (lowercase)")
     return ap.parse_args()
 
-def main():
-    args = parse_cli()
-
-    stations = (list(map(int, args.stations.split(",")))
-                if args.stations else STATIONS_ALL)
-    params   = (args.parameters.lower().split(",")
-                if args.parameters else PARAMS_DEFAULT)
-    cols     = META_COLS + params
+def main() -> None:
+    args = parse_args()
+    params = args.parameters or PARAMS_DEFAULT
+    stations = args.stations or STATIONS_ALL
 
     if args.backfill:
         start = dt.date.fromisoformat(args.backfill[0])
         end   = dt.date.fromisoformat(args.backfill[1])
-        log(f"▶️ Backfill {start} … {end}")
-        for day in (start + dt.timedelta(n) for n in range((end-start).days+1)):
-            run_day(day, stations, params, cols)
+        day = start
+        log(f"▶️  Backfill {start} … {end}")
+        while day <= end:
+            run_day(day, stations, params)
+            day += dt.timedelta(days=1)
     else:
-        run_day(dt.date.today() - dt.timedelta(days=1), stations, params, cols)
+        run_day(dt.date.today() - dt.timedelta(days=1), stations, params)
 
-    export_last7(cols)
+    export_last7(META_COLS + params)
     if os.path.exists(TEMPLATE):
         with open(TEMPLATE) as r, open(f"{SITE_DIR}/index.html","w") as w:
             w.write(r.read())
-    print("🎉  WetterArena – Build abgeschlossen.")
+    print("🎉  WetterArena – Build complete")
 
 if __name__ == "__main__":
     main()
