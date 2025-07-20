@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 # ### paste & run ───────────────────────────────────────────────────────────
 """
-monthly.py – WetterArena v9.2  (reiner Monats-Fetcher)
+monthly.py – WetterArena v10  (Monats-Fetcher mit Bulk-Flush)
 
-• ruft ausschließlich den 1. Tag jedes Monats aus klima-v2-1m ab
-• Schrittweite = 1 Monat (keine Tages-Timeouts mehr)
-• CLI:
-      --backfill YYYY-MM-01 YYYY-MM-01
-      --stations id1,id2,…   (optional)
-      --skip-ok              (ignoriert Fehlblöcke; sonst Abbruch)
+• Lädt den 1. Tag jedes Monats aus klima-v2-1m – unverändert.
+• Schreibt alle Rows zunächst in einen In-Memory-/Disk-Puffer.
+• Ein einziger BULK-INSERT via execute_values() am Ende.
+• Fallback:
+      – Wenn keine DB-Verbindung möglich: Puffer in CSV sichern.
+      – Nächster Start liest CSV ein und flusht sie, bevor neue API-Calls laufen.
 """
-
 from __future__ import annotations
-import os, sys, csv, time, random, argparse, datetime as dt
+import os, sys, csv, time, random, argparse, datetime as dt, tempfile, atexit, json, pathlib
 from collections import deque
 from typing import Sequence, List
 
 import requests, psycopg2
-from psycopg2.extras import execute_values
+from psycopg2.extras import execute_values, register_default_jsonb
 
 # ───── Konfiguration ─────────────────────────────────────────────────────
 PG_URI   = os.environ["PG_URI"]
@@ -33,6 +32,9 @@ MAX_PER_HR      = 220
 HIST_SEC, HIST_HR, REQ_COUNT = deque(maxlen=MAX_PER_SEC), deque(maxlen=MAX_PER_HR), 0
 
 META_COLS = ["station", "date"]      # PK = (station, date)
+BUFFER_FILE = ".monthly_buffer.csv"  # lokaler Failsafe-Puffer
+ROW_BUFFER: list[list] = []          # wächst im RAM, wird bei Bedarf disk-gesichert
+MEM_DUMP_THRESHOLD = 250_000         # ab so vielen Zeilen schon im Lauf wegschreiben
 
 # ── Parameterliste ohne *_flag (gekürzt im Beispiel) ────────────────────
 PARAMS = [
@@ -294,16 +296,16 @@ PARAMS = [
     "tp_mittel",
 ]
 
+
 COLS = META_COLS + PARAMS
+SQL  = f"INSERT INTO monthly ({','.join(COLS)}) VALUES %s ON CONFLICT (station,date) DO NOTHING"
 
-# ───── Helpers für Monatsarithmetik ──────────────────────────────────────
-def month_start(d: dt.date) -> dt.date:
-    return d.replace(day=1)
-
+# ───── Helpers (Monatsarithmetik & Logging) ──────────────────────────────
+def month_start(d: dt.date) -> dt.date: return d.replace(day=1)
 def add_month(d: dt.date, n: int = 1) -> dt.date:
     y = d.year + (d.month - 1 + n) // 12
-    m = (d.month - 1 + n) % 12 + 1
-    return dt.date(y, m, 1)
+    return dt.date(y, (d.month - 1 + n) % 12 + 1, 1)
+log = lambda *a: print(*a, file=sys.stderr)
 
 # ───── Ratelimit-Throttle ───────────────────────────────────────────────
 def throttle():
@@ -323,7 +325,8 @@ def throttle():
 def stamp(): t = time.time(); HIST_SEC.append(t); HIST_HR.append(t)
 log = lambda *a: print(*a, file=sys.stderr)
 
-# ───── Station-Metadaten laden ──────────────────────────────────────────
+
+# ───── Station-Metadaten laden ───────────────────────────────────────────
 def load_stations() -> list[int]:
     ids, today = [], dt.date.today()
     with open(META_CSV, newline="", encoding="utf-8") as f:
@@ -356,23 +359,85 @@ def fetch_json(day: dt.date, ids: Sequence[int]) -> dict|None:
 
 # ───── JSON → Rows ──────────────────────────────────────────────────────
 def rows_from_json(js: dict) -> list[list]:
-    if not js or not js.get("features"): return []
+    """
+    Wandelt das GeoSphere-JSON in eine Zeilenliste um:
+    [station_id, date, absf_max, …]  – eine Zeile pro Station × Datum.
+    """
+    if not js or not js.get("features"):
+        return []
+
+    # Zeitstempel in ISO-8601 → date-Objekte (nur YYYY-MM-DD)
     dates = [dt.date.fromisoformat(ts[:10]) for ts in js["timestamps"]]
-    out = []
+
+    rows: list[list] = []
     for feat in js["features"]:
-        sid, pdata = feat["properties"]["station"], feat["properties"]["parameters"]
+        sid   = feat["properties"]["station"]
+        pdata = feat["properties"]["parameters"]
+
         for i, d in enumerate(dates):
-            row = [sid, d] + [pdata.get(p, {}).get("data", [None]*len(dates))[i] for p in PARAMS]
-            out.append(row)
+            # Werte in exakt der Reihenfolge aus PARAMS; fehlende => None
+            row = [sid, d] + [
+                pdata.get(p, {}).get("data", [None] * len(dates))[i]
+                for p in PARAMS
+            ]
+            rows.append(row)
+
+    return rows
+
+
+# ───── Row-Puffer-Handling ───────────────────────────────────────────────
+def buffer_extend(rows: list[list]):
+    """Hängt neue Rows an den In-Memory-Puffer an; bei großen Mengen früher Dumps."""
+    if not rows: return
+    ROW_BUFFER.extend(rows)
+    if len(ROW_BUFFER) >= MEM_DUMP_THRESHOLD:
+        dump_buffer_to_disk(append=True)      # Teildump, RAM freihalten
+        ROW_BUFFER.clear()
+
+def dump_buffer_to_disk(append: bool):
+    """Schreibt ROW_BUFFER zeilenweise nach BUFFER_FILE (CSV)."""
+    mode = "a" if append and pathlib.Path(BUFFER_FILE).exists() else "w"
+    with open(BUFFER_FILE, mode, newline="") as f:
+        w = csv.writer(f)
+        if mode == "w": w.writerow(COLS)      # Header nur einmal
+        w.writerows(ROW_BUFFER)
+
+def load_disk_buffer() -> None:
+    """Lädt evtl. vorhandenen Crash-Puffer wieder in ROW_BUFFER."""
+    if not pathlib.Path(BUFFER_FILE).exists(): return
+    with open(BUFFER_FILE, newline="") as f:
+        r = csv.reader(f); next(r, None)      # Header skippen
+        ROW_BUFFER.extend([conv_row(row) for row in r])
+    os.remove(BUFFER_FILE)
+    log(f"↻  Crash-Puffer mit {len(ROW_BUFFER):,} Zeilen wiederhergestellt.")
+
+def conv_row(row: list[str]) -> list:
+    """CSV-Strings → passende Python-Types (None, int, float)"""
+    out: list = [int(row[0]), dt.date.fromisoformat(row[1])]
+    for v in row[2:]:
+        if v == "":      out.append(None)
+        elif v.isdigit(): out.append(int(v))
+        else:            out.append(float(v))
     return out
 
-SQL = f"INSERT INTO monthly ({','.join(COLS)}) VALUES %s ON CONFLICT (station,date) DO NOTHING"
-def upsert(rows): 
-    if not rows: return 0
-    with psycopg2.connect(PG_URI) as c, c.cursor() as cur:
-        execute_values(cur, SQL, rows, page_size=1000); return cur.rowcount or 0
+def flush_to_db():
+    """Versucht ROW_BUFFER vollständig in einem Rutsch in die DB zu schreiben."""
+    if not ROW_BUFFER: return
+    try:
+        with psycopg2.connect(PG_URI) as c, c.cursor() as cur:
+            execute_values(cur, SQL, ROW_BUFFER, page_size=10_000)
+        log(f"✅  {len(ROW_BUFFER):,} Zeilen in Postgres geschrieben.")
+        ROW_BUFFER.clear()
+    except psycopg2.OperationalError as e:
+        log("⚠️  DB-Verbindungsproblem:", e)
+        dump_buffer_to_disk(append=False)     # komplette Pufferung
+        log(f"💾  {len(ROW_BUFFER):,} Zeilen in {BUFFER_FILE} gesichert – Script endet mit Fehlercode 1.")
+        sys.exit(1)
 
-# ───── Monats-Fetch ─────────────────────────────────────────────────────
+# Flush bei jedem regulären Beenden (auch Ctrl-C) versuchen
+atexit.register(flush_to_db)
+
+# ───── Monats-Fetch ──────────────────────────────────────────────────────
 def run_month(day: dt.date, ids: list[int], skip: bool) -> bool:
     fails = 0
     for blk in (ids[i:i+CHUNK_SIZE] for i in range(0, len(ids), CHUNK_SIZE)):
@@ -381,7 +446,8 @@ def run_month(day: dt.date, ids: list[int], skip: bool) -> bool:
             log("❌  failed block – skip"); fails += 1
             if fails >= 2 and not skip: sys.exit("🚫  two blocks failed – abort.")
             continue
-        n = upsert(rows_from_json(js)); log(f"{day} → {n} rows")
+        buffer_extend(rows_from_json(js))
+    log(f"{day} ✔  gesammelt (Puffer={len(ROW_BUFFER):,})")
     return fails == 0
 
 # ───── CLI + Ablauf ─────────────────────────────────────────────────────
@@ -393,6 +459,7 @@ def parse_args():
 
 def main():
     a = parse_args()
+    load_disk_buffer()                      # Crash-Reste zuerst flushen
 
     # Zeitspanne auf Monatsanfänge snappen
     if a.backfill:
@@ -416,7 +483,8 @@ def main():
             sys.exit("🚫  two consecutive months failed – abort.")
         cur = add_month(cur)
 
-    print("🎉  Monthly build complete.")
+    print("🎉  Monthly fetch complete – schreibe in DB …")
+    flush_to_db()                          # letzter Versuch; Fehler werden im Handler geloggt
 
 if __name__ == "__main__":
     main()
